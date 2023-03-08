@@ -5,4 +5,4 @@
 mod jwt;
 
 mod client;
-pub use self::client::{Error, Config, Client};
+pub use self::client::{Error, Config, Client, JwtError};

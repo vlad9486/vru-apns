@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, sync::{Arc, Mutex}};
 
 use http::{Request, HeaderMap, HeaderValue, Response};
 use h2::{
@@ -38,17 +38,35 @@ struct Connection {
 }
 
 pub struct Client {
-    config: Config,
-    token: jwt::T,
+    sandbox: bool,
+    issuer: String,
+    bundle_id: String,
+    token: Arc<Mutex<jwt::T>>,
     connector: tokio_rustls::TlsConnector,
     connection: Option<Connection>,
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Client {
+            sandbox: self.sandbox,
+            issuer: self.issuer.clone(),
+            bundle_id: self.bundle_id.clone(),
+            token: self.token.clone(),
+            connector: self.connector.clone(),
+            connection: None,
+        }
+    }
 }
 
 impl Client {
     pub fn new(config: Config) -> Result<Self, JwtError> {
         let token = jwt::T::new(&config.es256_secret, &config.key_id)?;
+        let token = Arc::new(Mutex::new(token));
         Ok(Client {
-            config,
+            sandbox: config.sandbox,
+            issuer: config.issuer,
+            bundle_id: config.bundle_id,
             token,
             connector: h2_connector(),
             connection: None,
@@ -56,7 +74,7 @@ impl Client {
     }
 
     fn endpoint(&self) -> &str {
-        if self.config.sandbox {
+        if self.sandbox {
             "api.sandbox.push.apple.com"
         } else {
             "api.push.apple.com"
@@ -82,8 +100,8 @@ impl Client {
     /// hint: use `None.into_iter().collect()` as empty additional headers
     pub async fn send_request(
         &mut self,
-        device_token: [u8; 32],
-        payload: &str,
+        device_token: &[u8],
+        payload: String,
         additional_headers: HeaderMap<HeaderValue>,
     ) -> Result<Response<RecvStream>, Error> {
         if self.connection.is_none() {
@@ -104,22 +122,21 @@ impl Client {
 
     async fn send_request_inner(
         &mut self,
-        device_token: [u8; 32],
-        payload: &str,
+        device_token: &[u8],
+        payload: String,
         additional_headers: HeaderMap<HeaderValue>,
     ) -> Result<Response<RecvStream>, Error> {
-        let auth = self.token.regenerate(&self.config.issuer);
+        let auth = self.token.lock().unwrap().regenerate(&self.issuer);
         let request = {
             let device_token = hex::encode(device_token);
             let uri = format!("https://{}/3/device/{device_token}", self.endpoint());
             let mut request = Request::post(uri).body(())?;
             let mut headers = additional_headers;
             headers.insert("authorization", format!("bearer {auth}").parse().unwrap());
-            headers.insert("apns-topic", self.config.bundle_id.parse().unwrap());
+            headers.insert("apns-topic", self.bundle_id.parse().unwrap());
             *request.headers_mut() = headers;
             request
         };
-        let payload = format!("{{ \"aps\": {payload} }}");
 
         let connection = self.connection.as_mut().unwrap();
         let (response, mut stream) = connection.inner.send_request(request, false)?;
@@ -130,7 +147,6 @@ impl Client {
 }
 
 fn h2_connector() -> tokio_rustls::TlsConnector {
-    use std::sync::Arc;
     use tokio_rustls::rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore};
 
     let tls_client_config = Arc::new({
