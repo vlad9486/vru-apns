@@ -1,4 +1,8 @@
-use std::{io, sync::{Arc, Mutex}};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    borrow::Cow,
+};
 
 use http::{Request, HeaderMap, HeaderValue, Response};
 use h2::{
@@ -27,9 +31,9 @@ pub enum Error {
 pub struct Config {
     pub sandbox: bool,
     pub es256_secret: [u8; 32],
-    pub key_id: String,
-    pub issuer: String,
-    pub bundle_id: String,
+    pub key_id: Cow<'static, str>,
+    pub issuer: Cow<'static, str>,
+    pub bundle_id: Cow<'static, str>,
 }
 
 struct Connection {
@@ -39,8 +43,8 @@ struct Connection {
 
 pub struct Client {
     sandbox: bool,
-    issuer: String,
-    bundle_id: String,
+    issuer: Cow<'static, str>,
+    bundle_id: Cow<'static, str>,
     token: Arc<Mutex<jwt::T>>,
     connector: tokio_rustls::TlsConnector,
     connection: Option<Connection>,
@@ -151,7 +155,7 @@ fn h2_connector() -> tokio_rustls::TlsConnector {
 
     let tls_client_config = Arc::new({
         let mut root_store = RootCertStore::empty();
-        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
             OwnedTrustAnchor::from_subject_spki_name_constraints(
                 ta.subject,
                 ta.spki,
