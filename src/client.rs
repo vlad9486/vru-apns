@@ -36,18 +36,25 @@ pub struct Config {
     pub bundle_id: Cow<'static, str>,
 }
 
-struct Connection {
-    inner: SendRequest<Bytes>,
-    handle: task::JoinHandle<()>,
-}
-
 pub struct Client {
     sandbox: bool,
     issuer: Cow<'static, str>,
     bundle_id: Cow<'static, str>,
     token: Arc<Mutex<jwt::T>>,
     connector: tokio_rustls::TlsConnector,
-    connection: Option<Connection>,
+    // TODO: connection pool?
+    connection: Arc<Mutex<Option<Connection>>>,
+}
+
+struct Connection {
+    inner: SendRequest<Bytes>,
+    task: Option<task::JoinHandle<Result<(), h2::Error>>>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        tokio::spawn(self.task.take().expect("must not call drop twice"));
+    }
 }
 
 impl Clone for Client {
@@ -58,7 +65,7 @@ impl Clone for Client {
             bundle_id: self.bundle_id.clone(),
             token: self.token.clone(),
             connector: self.connector.clone(),
-            connection: None,
+            connection: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -73,7 +80,7 @@ impl Client {
             bundle_id: config.bundle_id,
             token,
             connector: h2_connector(),
-            connection: None,
+            connection: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -92,40 +99,14 @@ impl Client {
             .connect(self.endpoint().try_into().unwrap(), tcp)
             .await?;
         let (inner, connection) = client::handshake(tls).await?;
-        let handle = tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                log::error!("{err}");
-            }
-        });
+        let task = Some(tokio::spawn(connection));
 
-        Ok(Connection { inner, handle })
+        Ok(Connection { inner, task })
     }
 
     /// hint: use `None.into_iter().collect()` as empty additional headers
     pub async fn send_request(
-        &mut self,
-        device_token: &[u8],
-        payload: String,
-        additional_headers: HeaderMap<HeaderValue>,
-    ) -> Result<Response<RecvStream>, Error> {
-        if self.connection.is_none() {
-            self.connection = Some(self.new_connection().await?);
-        }
-
-        self.send_request_inner(device_token, payload, additional_headers)
-            .await
-            .map_err(|err| {
-                if let Some(Connection { handle, .. }) = self.connection.take() {
-                    if !handle.is_finished() {
-                        handle.abort();
-                    }
-                }
-                err
-            })
-    }
-
-    async fn send_request_inner(
-        &mut self,
+        &self,
         device_token: &[u8],
         payload: String,
         additional_headers: HeaderMap<HeaderValue>,
@@ -142,11 +123,19 @@ impl Client {
             request
         };
 
-        let connection = self.connection.as_mut().unwrap();
+        let v = self.connection.lock().expect("poisoned").take();
+        let mut connection = match v {
+            Some(v) => v,
+            None => self.new_connection().await?,
+        };
+
         let (response, mut stream) = connection.inner.send_request(request, false)?;
         stream.send_data(payload.into(), true)?;
+        let response = response.await?;
 
-        response.await.map_err(From::from)
+        *self.connection.lock().expect("poisoned") = Some(connection);
+
+        Ok(response)
     }
 }
 
